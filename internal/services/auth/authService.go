@@ -2,9 +2,12 @@ package authService
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sso/internal/domain/models"
+	"sso/internal/lib/jwt"
+	"sso/internal/services/storage"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -35,6 +38,10 @@ type AppProvider interface {
 	App(ctx context.Context, appId int) (models.App, error)
 }
 
+var (
+	ErrInvalidCredentials = errors.New("invalid credentials")
+)
+
 func New(
 	log *slog.Logger,
 	userSaver UserSaver,
@@ -58,10 +65,37 @@ func (a *Auth) Login(ctx context.Context, email string, password string, appId i
 
 	user, err := a.userProvider.User(ctx, email)
 	if err != nil {
-		log.Error("failed to get user", slog.Any("err", err.Error()))
+		if errors.Is(err, storage.ErrUserNotFound) {
+			log.Warn("user not found", slog.Any("err", err))
+
+			return "", fmt.Errorf("%s: %w", op, ErrInvalidCredentials)
+		}
+		log.Error("failed to get user", slog.Any("err", err))
 
 		return "", fmt.Errorf("%s: %w", op, err)
 	}
+
+	if err := bcrypt.CompareHashAndPassword(user.PassHash, []byte(password)); err != nil {
+		log.Warn("invalid credentials", slog.Any("err", err))
+
+		return "", fmt.Errorf("%s: %w", op, ErrInvalidCredentials)
+	}
+
+	app, err := a.appProvider.App(ctx, appId)
+	if err != nil {
+		log.Error("failed to get app", slog.Any("err", err.Error()))
+
+		return "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	token, err = jwt.NewToken(user, app, a.tokenTTL)
+	if err != nil {
+		log.Error("failed to generate token", slog.Any("err", err.Error()))
+
+		return "", fmt.Errorf("%s: %w", op, err)
+	}
+
+	return token, nil
 }
 
 func (a *Auth) RegisterNewUser(ctx context.Context, email string, password string) (userId int64, err error) {
@@ -88,5 +122,14 @@ func (a *Auth) RegisterNewUser(ctx context.Context, email string, password strin
 }
 
 func (a *Auth) IsAdmin(ctx context.Context, userId int) (bool, error) {
-	panic("t")
+	const op = "auth.Admin"
+	log := a.log.With(slog.String("op", op))
+	log.Info("checking is user admin")
+
+	isAdmin, err := a.userProvider.IsAdmin(ctx, int64(userId))
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return isAdmin, nil
 }
